@@ -4,6 +4,7 @@ langchain-groq
 langchain-chroma
 langchain-text-splitters
 langgraph
+langsmith
 chromadb
 sentence-transformers
 python-dotenv
