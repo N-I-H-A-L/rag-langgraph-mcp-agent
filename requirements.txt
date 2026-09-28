@@ -3,9 +3,12 @@ langchain-community
 langchain-groq
 langchain-chroma
 langchain-text-splitters
+langchain-mcp-adapters
 langgraph
 langsmith
 chromadb
 sentence-transformers
 python-dotenv
 pypdf
+mcp
+ddgs

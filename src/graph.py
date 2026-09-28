@@ -9,6 +9,7 @@ from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from mcp_client import web_search_sync
 from query import LLM_MODEL, query_chunks
 
 # -----------------------------------------------------------------------------
@@ -18,7 +19,11 @@ from query import LLM_MODEL, query_chunks
 #
 #   START → decide_to_retrieve → retrieve → grade_documents → generate → END
 #                             ↘            ↘ rewrite_question ↗
+#                             ↘ web_search ↗ (also after max Chroma rewrites)
 #                              direct_answer → END
+#
+# web_search is a normal node, not ReAct. It calls an MCP tool the same way
+# retrieve calls query_chunks. Chroma is not an MCP tool.
 #
 # Pieces:
 #
@@ -114,7 +119,9 @@ The knowledge base contains documents about:
 
 If the latest user question (or a follow-up about those topics) can be answered
 from those documents, reply with exactly: retrieve
-Otherwise (greetings, small talk, unrelated topics), reply with exactly: direct""",
+If it needs live or current web information (news, recent events, facts that
+are not in those documents), reply with exactly: web_search
+Otherwise (greetings, small talk, simple arithmetic), reply with exactly: direct""",
         ),
         MessagesPlaceholder("messages"),
     ]
@@ -162,7 +169,9 @@ class RAGState(TypedDict):
     # StateGraph(RAGState) uses it as the schema for the shared state.
     question: str  # this turn's user text; default merge REPLACES each invoke
 
-    route: Literal["retrieve", "direct_answer"]  # written by the router node
+    route: Literal["retrieve", "direct_answer", "web_search"]  # written by the router node
+
+    web_results: str  # raw MCP web_search text; also copied into context for generate
     # Literal = "this key should be one of these values". Similar to enum in other languages.
 
     search_query: str  # text sent to Chroma; starts as the user question, may be rewritten
@@ -195,7 +204,13 @@ def decide_to_retrieve(state: RAGState) -> dict:
     # We're not appending this node's messages to the list since it's an internal vote whether to retrieve or direct the answer and is not relevant to the conversation history.
     decision = (ROUTER_PROMPT | get_llm()).invoke({"messages": state["messages"]})
     text = decision.content.strip().lower()
-    route = "retrieve" if "retrieve" in text else "direct_answer"
+    # Check web_search first: the model may mention more than one word.
+    if "web_search" in text:
+        route = "web_search"
+    elif "retrieve" in text:
+        route = "retrieve"
+    else:
+        route = "direct_answer"
     print(f"Router chose: {route}")
     return {"route": route}
     # When returned, the "route" key is added to the state by the StateGraph.
@@ -215,6 +230,20 @@ def retrieve(state: RAGState) -> dict:
         "rewrite_count": state.get("rewrite_count") or 0,
     }
     # Note: No appending of messages. LangGraph merges these keys into state.
+
+
+def web_search(state: RAGState) -> dict:
+    # NODE: live web results via MCP. Used when the router picks web_search,
+    # or when Chroma is still not relevant after MAX_REWRITES.
+    search_query = state.get("search_query") or state["question"]
+    web_results = web_search_sync(search_query)
+    print(f"Web search via MCP for: {search_query}")
+    return {
+        "web_results": web_results,
+        "context": web_results,
+        "search_query": search_query,
+        "results": state.get("results") or [],
+    }
 
 
 def generate(state: RAGState) -> dict:
@@ -279,10 +308,11 @@ def choose_branch(state: RAGState) -> str:
 
 def choose_after_grade(state: RAGState) -> str:
     # Not a node. CONDITIONAL EDGE after grade_documents.
-    # If we have rewritten too many times, stop looping and generate anyway.
+    # If we have rewritten too many times, fall back to MCP web search
+    # instead of generating from bad Chroma chunks.
     if (state.get("rewrite_count") or 0) >= MAX_REWRITES and state.get("grade") == "rewrite":
-        print("Max rewrites reached; generating with the current documents.")
-        return "generate"
+        print("Max rewrites reached; falling back to web search.")
+        return "web_search"
     return state["grade"]
 
 
@@ -295,6 +325,7 @@ graph.add_node("decide_to_retrieve", decide_to_retrieve)
 graph.add_node("retrieve", retrieve)
 graph.add_node("grade_documents", grade_documents)
 graph.add_node("rewrite_question", rewrite_question)
+graph.add_node("web_search", web_search)
 graph.add_node("generate", generate)
 graph.add_node("direct_answer", direct_answer)
 
@@ -309,6 +340,7 @@ graph.add_conditional_edges(
     {
         "retrieve": "retrieve",  # if it returns "retrieve", go here
         "direct_answer": "direct_answer",  # if it returns "direct_answer", go here
+        "web_search": "web_search",
     },
 )
 
@@ -322,11 +354,14 @@ graph.add_conditional_edges(
     {
         "generate": "generate",
         "rewrite": "rewrite_question",
+        "web_search": "web_search",
     },
 )
 
-# 7) NORMAL EDGES: rewrite always retrieves again; answers always stop at END.
+# 7) NORMAL EDGES: rewrite always retrieves again; web search then generate;
+#    answers always stop at END.
 graph.add_edge("rewrite_question", "retrieve")
+graph.add_edge("web_search", "generate")
 graph.add_edge("generate", END)
 graph.add_edge("direct_answer", END)
 
@@ -358,6 +393,10 @@ if __name__ == "__main__":
         print(f"\nAnswer ({len(messages)} messages stored):")
         print(result["answer"])
         print()
+        if result.get("web_results"):
+            print("--- web search (MCP) ---")
+            print(result["web_results"])
+            print()
         for i, (chunk, score) in enumerate(result.get("results") or [], start=1):
             print(f"--- chunk {i} | score: {score:.4f} ---")
             print(chunk)

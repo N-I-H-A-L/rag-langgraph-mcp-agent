@@ -134,6 +134,7 @@ def rag_bot(question: str) -> dict:
         "documents": documents,
         "route": result.get("route"),
         "search_query": result.get("search_query"),
+        "web_results": result.get("web_results") or "",
     }
 
 
